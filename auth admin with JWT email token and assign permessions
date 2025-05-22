@@ -1,0 +1,169 @@
+<?php
+
+namespace App\Modules\Admin\app\Logic;
+use App\Interfaces\LifeCycleInterface;
+use App\Traits\LifeCycle;
+use Exception;
+use Illuminate\Support\Facades\Mail;
+use Tymon\JWTAuth\Facades\JWTAuth;
+
+// Models
+use App\Modules\Permissions\app\Models\Role;
+use App\Modules\Admin\app\Models\Admin;
+
+// Resource
+use App\Modules\Admin\app\Http\Resources\AdminResource;
+
+// Notifications
+use App\Modules\Admin\Notifications\AdminNotification;
+use App\Modules\Notifications\app\Events\PusherNotifyEvent;
+use Carbon\Carbon;
+
+class CreateAdminLogic implements LifeCycleInterface
+{
+    use LifeCycle;
+    private static $adminData, $admin, $mailData, $expires, $adminToken;
+
+    /**
+     * ## Prepare the admin data from the request,
+     */
+    public static function prepare()
+    {
+        if (self::hasErrors()) return self::next();
+        $request = self::$request;
+
+        $data = $request->only(["email", "name"]);
+        $data['is_active'] = 1;
+        $data['session_datetime'] = Carbon::now();
+
+        if ($request->hasFile('image')) {
+            try {
+                if (env("UPLOAD_DRIVER") == 'aws') {
+                    $data['image'] = $request->file("image")->storePublicly("admin/image", "s3");
+                } else {
+                    $data['image'] = $request->file("image")->store("admin/image", "public");
+                }
+            } catch (Exception $e) {
+                self::setError(["message" => "cant upload admin image"]);
+            }
+        }
+
+        self::$adminData = $data;
+        return new self;
+    }
+
+
+    /**
+     * ## Create the admin record in the database and
+     */
+    public static function create()
+    {
+        if (self::hasErrors()) return self::next();
+
+        self::$admin = Admin::create(self::$adminData);
+        if (!self::$admin) {
+            self::setError(["message" => "cant create admin data"]);
+            return new self;
+        }
+
+        self::$expires = 5;
+        JWTAuth::factory()->setTTL(5);
+        $token = JWTAuth::fromUser(self::$admin);
+        $mailData = [
+            "url" => verifyAccountPasswordRoute([
+                "token" => $token,
+                "target" => "admin"
+            ]),
+            "name" => self::$admin->name
+        ];
+
+        self::$admin->update([
+            'verify_token' => $token
+        ]);
+
+        self::$mailData = $mailData;
+        self::$adminData = self::$admin;
+        self::$adminToken = $token;
+
+        return new self;
+    }
+
+
+    /**
+     * ## Assigns roles to the admin user.
+     */
+    public static function assignRoles()
+    {
+        if (self::hasErrors()) return self::next();
+        $request = self::$request;
+
+        try {
+            $roles = $request->get('role', []);
+            self::$admin->syncRoles($roles);
+            $permissions = collect($roles)
+                ->map(function ($roleName) {
+                    return Role::where('name', $roleName)->where('guard_name', 'admin')->first()?->permissions ?? [];
+                })->flatten()->pluck('name')->unique();
+
+            self::$admin->givePermissionTo($permissions);
+        } catch (\Exception $e) {
+            self::$adminData->forceDelete();
+            self::setError(["message" => "failed to assign admin roles"]);
+        }
+
+        return new self;
+    }
+
+
+    /**
+     * ## Send the verification email to the admin,
+     * and notify the current admin about the creation.
+     */
+    public static function sendMail()
+    {
+        if (self::hasErrors())
+            return self::next();
+        $request = self::$request;
+
+        try {
+            $temVars = array('$appname', '$date', '$url', '$name');
+            $temReplacement = array(config('app.name'), date('Y'), self::$mailData['url'], self::$mailData['name']);
+            $template = replaceMailTemplate("verifyAccount", $temVars, $temReplacement);
+
+            Mail::send('mail.mailTemplate', $template, function ($mail) use ($request) {
+                $mail->to($request->email, $request->name)->subject('Verify your account');
+            });
+
+            $title = __("create admin account");
+            $message = "The Admin " . $request->email . " is created successfuly";
+            $currentAdmin = auth()->guard('admin')->user();
+            $currentAdmin->notify(new AdminNotification($currentAdmin, $title, $message));
+            $notification = getCurrenctNotification($currentAdmin);
+            event(new PusherNotifyEvent($currentAdmin->only(['id', 'name', 'email', 'is_active']), $title, $message, $notification));
+        } catch (\Exception $e) {
+            self::$adminData->forceDelete();
+            self::setError([
+                "mail" => __("The mail is failed to  sent"),
+                "server_error" => $e->getMessage()
+            ]);
+        }
+
+        return new self;
+    }
+
+
+    /**
+     * ## Return the appropriate response based on success or error.
+     */
+    public static function response()
+    {
+        if (self::hasErrors()) {
+            return responseError(__("Create New Admin"), self::getErrors(), 401);
+        }
+
+        return responseSuccess(__("Create New Admin"), [ 'message' => __("admin is created successfuly"),
+            'admin' => new AdminResource(self::$adminData),
+            'expires_in' => self::$expires * 60
+        ]);
+    }
+}
